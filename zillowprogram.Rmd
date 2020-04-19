@@ -1,0 +1,101 @@
+---
+title: "Zillow"
+author: "Christian Ramsland"
+date: "December 16, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(ZillowR)
+library(readr)
+library(XML)
+library(randomForest)
+library(parallel)
+library(microbenchmark)
+```
+Obtains the census data and creates a string of Los Angeles addresses to be accepted by the Zillow API afterward.
+
+```{r, eval=FALSE}
+LAaddress <- read_csv("https://data.lacity.org/api/views/4ca8-mxuh/rows.csv?accessType=DOWNLOAD")
+addressname <- paste(LAaddress$HSE_NBR,LAaddress$HSE_DIR_CD,LAaddress$STR_NM,sep = " ")
+```
+
+Generates the zillowdata.csv file.
+```{r, eval=FALSE}
+zillowParse <- function(var1){
+  x <- GetDeepSearchResults(address = var1, citystatezip = "Los Angeles, CA", zws_id = "X1-ZWz1gsvbnh5u6j_81d4x")
+  if(x$message$code =="0"){
+    split <- xmlChildren(xmlChildren(xmlChildren(x$response)$results)$result)
+    splitunlist <- unlist(sapply(xmlToList,X=split))
+    vals <- splitunlist[c("address.street","address.zipcode","address.city","useCode","taxAssessmentYear",
+                          "taxAssessment","yearBuilt","lotSizeSqFt","finishedSqFt","bathrooms","bedrooms",
+                          "zestimate.amount.text","localRealEstate.name","localRealEstate.type")]
+    Zillowdf <- as.data.frame(t(as.data.frame(vals)))
+    return(Zillowdf)
+  }
+  else{
+    return(NULL)
+  }
+}
+
+for (i in 1:length(addressname)){
+  record <- zillowParse(addressname[i])
+  if(!is.null(record)){
+    write_csv(x=record,path = "zillowdata.csv", append = TRUE)
+  }
+}
+```
+
+Since I already had zillowdata.csv in my working directory, I just reference that here. Reconfiguring certain values as factors and getting rid of records with na values to be used in the bagging model.
+```{r}
+zillowdata <- read_csv(file = "zillowdata.csv",col_names = c("address.street","address.zipcode","address.city","useCode","taxAssessmentYear",
+                                                             "taxAssessment","yearBuilt","lotSizeSqFt","finishedSqFt","bathrooms","bedrooms",
+                                                             "zestimate.amount.text","localRealEstate.name","localRealEstate.type"))
+zillowdata$localRealEstate.name <- as.factor(zillowdata$localRealEstate.name)
+zillowdata$useCode <- as.factor(zillowdata$useCode)
+zillowdata <- zillowdata[!is.na(zillowdata$useCode),]
+zillowdata <- zillowdata[!is.na(zillowdata$zestimate.amount.text),]
+zillowdata <- zillowdata[!is.na(zillowdata$taxAssessment),]
+zillowdata <- zillowdata[!is.na(zillowdata$finishedSqFt),]
+zillowdata <- zillowdata[!is.na(zillowdata$bathrooms),]
+zillowdata <- zillowdata[!is.na(zillowdata$bedrooms),]
+set.seed(50)
+train <- sample(1:nrow(zillowdata), size = nrow(zillowdata)*0.8)
+test <- dplyr::setdiff(1:nrow(zillowdata), train)
+zillowtrain <- zillowdata[train,]
+zillowtest <- zillowdata[test,]
+```
+
+
+For some reason, I get 16 for detectcores() which isn't right because I only have an 8-core processor. So I subtracted nine to get my parallel code running on seven of the cores on my machine. Here seq refers to sequential bagging, and par refers to parallel.
+```{r}
+seqTime <- microbenchmark({
+bagFit <- randomForest(zestimate.amount.text ~ useCode + taxAssessment + bedrooms+ bathrooms + finishedSqFt, data = zillowtrain, mtry = 4, ntree = 2009, importance = TRUE)
+bagPred <- predict(bagFit, newdata = dplyr::select(zillowtest, -zestimate.amount.text))
+}, times = 1,unit = "s")
+
+cores <- detectCores()
+cluster <- makeCluster(cores - 9) #this number is 7 on my system! It might not work well on yours.
+
+parTime <- microbenchmark({
+parallel.bag <- function(data1, ntree, data2) {
+  fit <- randomForest::randomForest(zestimate.amount.text ~ useCode + taxAssessment + bedrooms+ bathrooms + finishedSqFt, data = data1, mtry = 4, ntree = ntree, importance = TRUE)
+  pred <- predict(fit, newdata = dplyr::select(data2, -zestimate.amount.text))
+}
+results <- parLapply(cluster, X = c(287,287,287,287,287,287,287), fun = parallel.bag, data1 = zillowtrain, data2 = zillowtest)
+parallelbagPred <- rowMeans(as.data.frame(results))
+                          }, times = 1,unit = "s")
+seqTime
+parTime
+```
+Returns the mean square errors for the sequential "bagMSE" and parallel "parBagRMSE" fits with the test dataset.
+```{r}
+bagRMSE <- sqrt(mean((bagPred-zillowtest$zestimate.amount.text)^2)); bagRMSE
+parBagRMSE <- sqrt(mean((parallelbagPred-zillowtest$zestimate.amount.text)^2)); parBagRMSE
+```
+
+
